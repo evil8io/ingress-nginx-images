@@ -28,7 +28,7 @@ jobs:
     outputs:
       sha: ${{ steps.resolve.outputs.sha }}
       version: ${{ steps.resolve.outputs.version }}
-      build: ${{ steps.resolve.outputs.build }}
+      variants: ${{ steps.resolve.outputs.variants }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - id: resolve
@@ -59,15 +59,16 @@ jobs:
               -H 'Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json' \
               "https://ghcr.io/v2/${name}/manifests/${version}" || true
           }
+          all=(controller controller-chroot)
+          missing=()
           if [[ -n "${INPUT_TAG}" ]]; then
-            build=true
+            missing=("${all[@]}")
           else
-            build=false
-            for variant in controller controller-chroot; do
+            for variant in "${all[@]}"; do
               status=$(manifest_status "${variant}")
               case "${status}" in
                 200) echo "${variant}:${version} is already published" ;;
-                404) build=true ;;
+                404) missing+=("${variant}") ;;
                 *)
                   echo "ghcr.io returned HTTP status '${status}' for ${variant}:${version} without credentials"
                   exit 1
@@ -75,14 +76,15 @@ jobs:
               esac
             done
           fi
+          variants=$(jq -cn '$ARGS.positional' --args "${missing[@]}")
           {
             echo "sha=${sha}"
             echo "version=${version}"
-            echo "build=${build}"
+            echo "variants=${variants}"
           } >> "$GITHUB_OUTPUT"
-          echo "${tag} (${sha}) -> ${version} (build=${build})"
+          echo "${tag} (${sha}) -> ${version} (variants to build: ${variants})"
       - name: Keepalive
-        if: steps.resolve.outputs.build == 'false' && github.ref == 'refs/heads/main'
+        if: steps.resolve.outputs.variants == '[]' && github.ref == 'refs/heads/main'
         run: |
           set -euo pipefail
           last=$(git log -1 --format=%ct)
@@ -97,20 +99,23 @@ jobs:
 
   build:
     needs: resolve
-    if: needs.resolve.outputs.build == 'true'
+    if: needs.resolve.outputs.variants != '[]'
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - arch: amd64
-            runner: ubuntu-latest
-          - arch: arm64
-            runner: ubuntu-24.04-arm
-    runs-on: ${{ matrix.runner }}
+        variant: ${{ fromJSON(needs.resolve.outputs.variants) }}
+        arch: [amd64, arm64]
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
     permissions:
       contents: read
       packages: write
+    outputs:
+      controller_amd64: ${{ steps.push.outputs.controller_amd64 }}
+      controller_arm64: ${{ steps.push.outputs.controller_arm64 }}
+      controller_chroot_amd64: ${{ steps.push.outputs.controller_chroot_amd64 }}
+      controller_chroot_arm64: ${{ steps.push.outputs.controller_chroot_arm64 }}
     env:
+      VARIANT: ${{ matrix.variant }}
       ARCH: ${{ matrix.arch }}
       SHA: ${{ needs.resolve.outputs.sha }}
       VERSION: ${{ needs.resolve.outputs.version }}
@@ -149,96 +154,112 @@ jobs:
       - name: Build the NGINX base image
         working-directory: upstream
         run: docker buildx build --load --provenance=false --tag "${LOCAL_PREFIX}/nginx:${VERSION}" images/nginx/rootfs
-      - name: Build the controller images
+      - name: Build the controller image
         working-directory: upstream
         run: |
           set -euo pipefail
-          for variant in controller controller-chroot; do
-            file=rootfs/Dockerfile
-            if [[ "${variant}" == controller-chroot ]]; then
-              file=rootfs/Dockerfile-chroot
-            fi
-            docker buildx build --load --provenance=false --no-cache \
-              --build-arg "BASE_IMAGE=${LOCAL_PREFIX}/nginx:${VERSION}" \
-              --build-arg "VERSION=${VERSION}" \
-              --build-arg "TARGETARCH=${ARCH}" \
-              --build-arg "COMMIT_SHA=git-${SHA:0:7}" \
-              --file "${file}" \
-              --tag "${LOCAL_PREFIX}/${variant}:${VERSION}" rootfs
-          done
+          file=rootfs/Dockerfile
+          if [[ "${VARIANT}" == controller-chroot ]]; then
+            file=rootfs/Dockerfile-chroot
+          fi
+          docker buildx build --load --provenance=false --no-cache \
+            --build-arg "BASE_IMAGE=${LOCAL_PREFIX}/nginx:${VERSION}" \
+            --build-arg "VERSION=${VERSION}" \
+            --build-arg "TARGETARCH=${ARCH}" \
+            --build-arg "COMMIT_SHA=git-${SHA:0:7}" \
+            --file "${file}" \
+            --tag "${LOCAL_PREFIX}/${VARIANT}:${VERSION}" rootfs
       - name: Add the license and the labels
         run: |
           set -euo pipefail
-          for variant in controller controller-chroot; do
-            docker buildx build --load --provenance=false \
-              --build-arg "CONTROLLER_IMAGE=${LOCAL_PREFIX}/${variant}:${VERSION}" \
-              --tag "${IMAGE_PREFIX}/${variant}:${VERSION}-${ARCH}" self
-          done
-      - name: Verify the images
+          docker buildx build --load --provenance=false \
+            --build-arg "CONTROLLER_IMAGE=${LOCAL_PREFIX}/${VARIANT}:${VERSION}" \
+            --tag "${IMAGE_PREFIX}/${VARIANT}:${VERSION}-${ARCH}" self
+      - name: Verify the image
         run: |
           set -euo pipefail
           base="${LOCAL_PREFIX}/nginx:${VERSION}"
-          layers() { docker image inspect --format '{{json .RootFS.Layers}}' "$1"; }
-          nginx_sum() { docker run --rm --entrypoint sha256sum "$1" "$2" | cut -d' ' -f1; }
-          base_layers=$(layers "${base}")
-          controller_layers=$(layers "${IMAGE_PREFIX}/controller:${VERSION}-${ARCH}")
-          if ! jq -en --argjson base "${base_layers}" --argjson image "${controller_layers}" \
-            '($base | length) > 0 and $image[:($base | length)] == $base' >/dev/null; then
-            echo "the controller image is not built on the NGINX base image of this run"
-            exit 1
-          fi
-          want=$(nginx_sum "${base}" /usr/local/nginx/sbin/nginx)
-          got=$(nginx_sum "${IMAGE_PREFIX}/controller-chroot:${VERSION}-${ARCH}" /chroot/usr/local/nginx/sbin/nginx)
-          echo "nginx binary: base ${want}, chroot ${got}"
-          if [[ -z "${want}" || "${want}" != "${got}" ]]; then
-            echo "the nginx binary of the chroot image is not the binary of the NGINX base image of this run"
-            exit 1
-          fi
-          for variant in controller controller-chroot; do
-            image="${IMAGE_PREFIX}/${variant}:${VERSION}-${ARCH}"
-            caps=(--cap-drop ALL --cap-add NET_BIND_SERVICE)
-            if [[ "${variant}" == controller-chroot ]]; then
-              caps+=(--cap-add SYS_CHROOT --cap-add SYS_ADMIN)
+          image="${IMAGE_PREFIX}/${VARIANT}:${VERSION}-${ARCH}"
+          caps=(--cap-drop ALL --cap-add NET_BIND_SERVICE)
+          if [[ "${VARIANT}" == controller-chroot ]]; then
+            caps+=(--cap-add SYS_CHROOT --cap-add SYS_ADMIN)
+            nginx_sum() { docker run --rm --entrypoint sha256sum "$1" "$2" | cut -d' ' -f1; }
+            want=$(nginx_sum "${base}" /usr/local/nginx/sbin/nginx)
+            got=$(nginx_sum "${image}" /chroot/usr/local/nginx/sbin/nginx)
+            echo "nginx binary: base ${want}, chroot ${got}"
+            if [[ -z "${want}" || "${want}" != "${got}" ]]; then
+              echo "the nginx binary of the chroot image is not the binary of the NGINX base image of this run"
+              exit 1
             fi
-            docker run --rm "${caps[@]}" "${image}" /nginx-ingress-controller --version | tee version.txt
-            grep -qE "Release:[[:space:]]+${VERSION}[[:space:]]*$" version.txt
-            grep -q 'nginx version: nginx/' version.txt
-            docker image inspect --format '{{json .Config.Labels}}' "${image}" | jq .
-          done
-      - name: Push the images
+          else
+            layers() { docker image inspect --format '{{json .RootFS.Layers}}' "$1"; }
+            base_layers=$(layers "${base}")
+            image_layers=$(layers "${image}")
+            if ! jq -en --argjson base "${base_layers}" --argjson image "${image_layers}" \
+              '($base | length) > 0 and $image[:($base | length)] == $base' >/dev/null; then
+              echo "the controller image is not built on the NGINX base image of this run"
+              exit 1
+            fi
+          fi
+          docker run --rm "${caps[@]}" "${image}" /nginx-ingress-controller --version | tee version.txt
+          grep -qE "Release:[[:space:]]+${VERSION}[[:space:]]*$" version.txt
+          grep -q 'nginx version: nginx/' version.txt
+          docker image inspect --format '{{json .Config.Labels}}' "${image}" | jq .
+      - name: Push the image
+        id: push
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          image="${IMAGE_PREFIX}/${VARIANT}:${VERSION}-${ARCH}"
           docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin <<<"${GH_TOKEN}"
-          for variant in controller controller-chroot; do
-            docker push "${IMAGE_PREFIX}/${variant}:${VERSION}-${ARCH}"
-          done
+          docker push "${image}"
+          digest=$(docker buildx imagetools inspect "${image}" --format '{{json .Manifest}}' | jq -r '.digest')
+          if [[ ! "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "the registry did not return a digest for ${image}: '${digest}'"
+            exit 1
+          fi
+          echo "${VARIANT//-/_}_${ARCH}=${digest}" >> "$GITHUB_OUTPUT"
+          echo "${image}@${digest}"
 
   merge:
     needs: [resolve, build]
+    if: ${{ !cancelled() && needs.resolve.result == 'success' && needs.resolve.outputs.variants != '[]' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: ${{ fromJSON(needs.resolve.outputs.variants) }}
     runs-on: ubuntu-latest
     permissions:
       packages: write
     env:
+      VARIANT: ${{ matrix.variant }}
       VERSION: ${{ needs.resolve.outputs.version }}
+      DIGESTS: ${{ toJSON(needs.build.outputs) }}
     steps:
-      - name: Merge and verify the manifests
+      - name: Merge and verify the manifest
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin <<<"${GH_TOKEN}"
-          for variant in controller controller-chroot; do
-            ref="${IMAGE_PREFIX}/${variant}:${VERSION}"
-            docker buildx imagetools create -t "${ref}" "${ref}-amd64" "${ref}-arm64"
-            out=$(docker buildx imagetools inspect "${ref}")
-            echo "${out}"
-            grep -q 'linux/amd64' <<<"${out}"
-            grep -q 'linux/arm64' <<<"${out}"
-            {
-              echo '```'
-              echo "${out}"
-              echo '```'
-            } >> "$GITHUB_STEP_SUMMARY"
+          repository="${IMAGE_PREFIX}/${VARIANT}"
+          sources=()
+          for arch in amd64 arm64; do
+            digest=$(jq -r --arg key "${VARIANT//-/_}_${arch}" '.[$key] // empty' <<<"${DIGESTS}")
+            if [[ -z "${digest}" ]]; then
+              echo "the ${arch} build of ${VARIANT} did not push an image in this run"
+              exit 1
+            fi
+            sources+=("${repository}@${digest}")
           done
+          docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin <<<"${GH_TOKEN}"
+          docker buildx imagetools create -t "${repository}:${VERSION}" "${sources[@]}"
+          out=$(docker buildx imagetools inspect "${repository}:${VERSION}")
+          echo "${out}"
+          grep -q 'linux/amd64' <<<"${out}"
+          grep -q 'linux/arm64' <<<"${out}"
+          {
+            echo '```'
+            echo "${out}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
