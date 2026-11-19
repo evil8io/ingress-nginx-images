@@ -25,7 +25,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      packages: read
     outputs:
       sha: ${{ steps.resolve.outputs.sha }}
       version: ${{ steps.resolve.outputs.version }}
@@ -51,18 +50,30 @@ jobs:
           fi
           sha=$(gh api "repos/${UPSTREAM_REPO}/commits/${tag}" --jq '.sha')
           version="${tag#controller-}"
+          manifest_status() {
+            local name="${IMAGE_PREFIX#ghcr.io/}/$1" token
+            token=$(curl -sS "https://ghcr.io/token?service=ghcr.io&scope=repository:${name}:pull" \
+              | jq -r '.token // empty') || true
+            curl -sS -o /dev/null -w '%{http_code}' \
+              -H "Authorization: Bearer ${token}" \
+              -H 'Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json' \
+              "https://ghcr.io/v2/${name}/manifests/${version}" || true
+          }
           if [[ -n "${INPUT_TAG}" ]]; then
             build=true
           else
-            docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin <<<"${GH_TOKEN}"
-            published() { docker manifest inspect "$1" >/dev/null 2>&1; }
-            if published "${IMAGE_PREFIX}/controller:${version}" \
-              && published "${IMAGE_PREFIX}/controller-chroot:${version}"; then
-              build=false
-              echo "the images of ${version} are already published"
-            else
-              build=true
-            fi
+            build=false
+            for variant in controller controller-chroot; do
+              status=$(manifest_status "${variant}")
+              case "${status}" in
+                200) echo "${variant}:${version} is already published" ;;
+                404) build=true ;;
+                *)
+                  echo "ghcr.io returned HTTP status '${status}' for ${variant}:${version} without credentials"
+                  exit 1
+                  ;;
+              esac
+            done
           fi
           {
             echo "sha=${sha}"
@@ -107,12 +118,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: self
+          persist-credentials: false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ env.UPSTREAM_REPO }}
           ref: ${{ needs.resolve.outputs.sha }}
           fetch-depth: 1
           path: upstream
+          persist-credentials: false
       - id: go
         working-directory: upstream
         run: echo "version=$(cut -d. -f1,2 GOLANG_VERSION)" >> "$GITHUB_OUTPUT"
@@ -184,7 +197,11 @@ jobs:
           fi
           for variant in controller controller-chroot; do
             image="${IMAGE_PREFIX}/${variant}:${VERSION}-${ARCH}"
-            docker run --rm "${image}" /nginx-ingress-controller --version | tee version.txt
+            caps=(--cap-drop ALL --cap-add NET_BIND_SERVICE)
+            if [[ "${variant}" == controller-chroot ]]; then
+              caps+=(--cap-add SYS_CHROOT --cap-add SYS_ADMIN)
+            fi
+            docker run --rm "${caps[@]}" "${image}" /nginx-ingress-controller --version | tee version.txt
             grep -qE "Release:[[:space:]]+${VERSION}[[:space:]]*$" version.txt
             grep -q 'nginx version: nginx/' version.txt
             docker image inspect --format '{{json .Config.Labels}}' "${image}" | jq .
