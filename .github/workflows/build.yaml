@@ -112,6 +112,7 @@ jobs:
       packages: write
     env:
       ARCH: ${{ matrix.arch }}
+      SHA: ${{ needs.resolve.outputs.sha }}
       VERSION: ${{ needs.resolve.outputs.version }}
       LOCAL_PREFIX: localhost/ingress-nginx
     steps:
@@ -126,24 +127,25 @@ jobs:
           fetch-depth: 1
           path: upstream
           persist-credentials: false
-      - id: go
-        working-directory: upstream
-        run: echo "version=$(cut -d. -f1,2 GOLANG_VERSION)" >> "$GITHUB_OUTPUT"
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version: ${{ steps.go.outputs.version }}
-          check-latest: true
-          cache: false
       - name: Build the binaries
         working-directory: upstream
-        env:
-          PKG: k8s.io/ingress-nginx
-          REPO_INFO: https://github.com/${{ env.UPSTREAM_REPO }}
-          TAG: ${{ needs.resolve.outputs.version }}
         run: |
           set -euo pipefail
-          go version
-          COMMIT_SHA="git-$(git rev-parse --short HEAD)" bash build/build.sh
+          go_minor=$(cut -d. -f1,2 GOLANG_VERSION)
+          if [[ ! "${go_minor}" =~ ^[0-9]+\.[0-9]+$ ]]; then
+            echo "GOLANG_VERSION does not contain a Go version: '${go_minor}'"
+            exit 1
+          fi
+          docker run --rm \
+            --volume "${PWD}:/go/src/k8s.io/ingress-nginx" \
+            --workdir /go/src/k8s.io/ingress-nginx \
+            --env PKG=k8s.io/ingress-nginx \
+            --env ARCH \
+            --env "TAG=${VERSION}" \
+            --env "COMMIT_SHA=git-${SHA:0:7}" \
+            --env "REPO_INFO=https://github.com/${UPSTREAM_REPO}" \
+            "golang:${go_minor}-alpine" \
+            /bin/sh -ec 'go version; /bin/sh build/build.sh'
       - name: Build the NGINX base image
         working-directory: upstream
         run: docker buildx build --load --provenance=false --tag "${LOCAL_PREFIX}/nginx:${VERSION}" images/nginx/rootfs
@@ -160,20 +162,17 @@ jobs:
               --build-arg "BASE_IMAGE=${LOCAL_PREFIX}/nginx:${VERSION}" \
               --build-arg "VERSION=${VERSION}" \
               --build-arg "TARGETARCH=${ARCH}" \
-              --build-arg "COMMIT_SHA=git-$(git rev-parse --short HEAD)" \
+              --build-arg "COMMIT_SHA=git-${SHA:0:7}" \
               --file "${file}" \
               --tag "${LOCAL_PREFIX}/${variant}:${VERSION}" rootfs
           done
       - name: Add the license and the labels
         run: |
           set -euo pipefail
-          mkdir context
-          cp upstream/LICENSE context/LICENSE
           for variant in controller controller-chroot; do
             docker buildx build --load --provenance=false \
               --build-arg "CONTROLLER_IMAGE=${LOCAL_PREFIX}/${variant}:${VERSION}" \
-              --file self/Dockerfile \
-              --tag "${IMAGE_PREFIX}/${variant}:${VERSION}-${ARCH}" context
+              --tag "${IMAGE_PREFIX}/${variant}:${VERSION}-${ARCH}" self
           done
       - name: Verify the images
         run: |
