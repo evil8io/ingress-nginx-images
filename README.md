@@ -10,6 +10,7 @@ Chainguard.
 
 ```
 ghcr.io/evil8io/images/ingress-nginx/controller:<version>
+ghcr.io/evil8io/images/ingress-nginx/controller-chroot:<version>
 ```
 
 With the ingress-nginx Helm chart:
