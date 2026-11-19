@@ -1,0 +1,201 @@
+name: build
+
+on:
+  schedule:
+    - cron: "15 6 * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag of the fork to build, for example controller-v1.15.16; empty builds the highest release tag"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}
+
+env:
+  UPSTREAM_REPO: chainguard-forks/ingress-nginx
+  IMAGE: ghcr.io/evil8io/images/ingress-nginx/controller
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: read
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+      version: ${{ steps.resolve.outputs.version }}
+      build: ${{ steps.resolve.outputs.build }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag || '' }}
+        run: |
+          set -euo pipefail
+          pattern='^controller-v[0-9]+\.[0-9]+\.[0-9]+$'
+          tag="${INPUT_TAG}"
+          if [[ -z "${tag}" ]]; then
+            tag=$(gh api --paginate "repos/${UPSTREAM_REPO}/git/matching-refs/tags/controller-v" \
+              --jq '.[].ref | sub("^refs/tags/"; "")' \
+              | grep -E "${pattern}" | sort -V | tail -1)
+          fi
+          if [[ ! "${tag}" =~ ${pattern} ]]; then
+            echo "the tag '${tag}' does not match ${pattern}"
+            exit 1
+          fi
+          sha=$(gh api "repos/${UPSTREAM_REPO}/commits/${tag}" --jq '.sha')
+          version="${tag#controller-}"
+          if [[ -n "${INPUT_TAG}" ]]; then
+            build=true
+          else
+            docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin <<<"${GH_TOKEN}"
+            if docker manifest inspect "${IMAGE}:${version}" >/dev/null 2>&1; then
+              build=false
+              echo "${IMAGE}:${version} is already published"
+            else
+              build=true
+            fi
+          fi
+          {
+            echo "sha=${sha}"
+            echo "version=${version}"
+            echo "build=${build}"
+          } >> "$GITHUB_OUTPUT"
+          echo "${tag} (${sha}) -> ${IMAGE}:${version} (build=${build})"
+      - name: Keepalive
+        if: steps.resolve.outputs.build == 'false' && github.ref == 'refs/heads/main'
+        run: |
+          set -euo pipefail
+          last=$(git log -1 --format=%ct)
+          if (( $(date +%s) - last <= 50 * 86400 )); then
+            echo "last commit is recent enough"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit --allow-empty -m "chore: keepalive"
+          git push
+
+  build:
+    needs: resolve
+    if: needs.resolve.outputs.build == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    env:
+      ARCH: ${{ matrix.arch }}
+      VERSION: ${{ needs.resolve.outputs.version }}
+      BASE_IMAGE: localhost/ingress-nginx/nginx:${{ needs.resolve.outputs.version }}
+      UPSTREAM_IMAGE: localhost/ingress-nginx/controller:${{ needs.resolve.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: self
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ needs.resolve.outputs.sha }}
+          fetch-depth: 1
+          path: upstream
+      - id: go
+        working-directory: upstream
+        run: echo "version=$(cut -d. -f1,2 GOLANG_VERSION)" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ steps.go.outputs.version }}
+          check-latest: true
+          cache: false
+      - name: Build the binaries
+        working-directory: upstream
+        env:
+          PKG: k8s.io/ingress-nginx
+          REPO_INFO: https://github.com/${{ env.UPSTREAM_REPO }}
+          TAG: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          go version
+          COMMIT_SHA="git-$(git rev-parse --short HEAD)" bash build/build.sh
+      - name: Build the NGINX base image
+        working-directory: upstream
+        run: docker buildx build --load --provenance=false --tag "${BASE_IMAGE}" images/nginx/rootfs
+      - name: Build the controller image
+        working-directory: upstream
+        run: |
+          set -euo pipefail
+          docker buildx build --load --provenance=false --no-cache \
+            --build-arg "BASE_IMAGE=${BASE_IMAGE}" \
+            --build-arg "VERSION=${VERSION}" \
+            --build-arg "TARGETARCH=${ARCH}" \
+            --build-arg "COMMIT_SHA=git-$(git rev-parse --short HEAD)" \
+            --tag "${UPSTREAM_IMAGE}" rootfs
+      - name: Add the license and the labels
+        run: |
+          set -euo pipefail
+          mkdir context
+          cp upstream/LICENSE context/LICENSE
+          docker buildx build --load --provenance=false \
+            --build-arg "CONTROLLER_IMAGE=${UPSTREAM_IMAGE}" \
+            --file self/Dockerfile \
+            --tag "${IMAGE}:${VERSION}-${ARCH}" context
+      - name: Verify the image
+        run: |
+          set -euo pipefail
+          base=$(docker image inspect --format '{{json .RootFS.Layers}}' "${BASE_IMAGE}")
+          image=$(docker image inspect --format '{{json .RootFS.Layers}}' "${IMAGE}:${VERSION}-${ARCH}")
+          if ! jq -en --argjson base "${base}" --argjson image "${image}" \
+            '($base | length) > 0 and $image[:($base | length)] == $base' >/dev/null; then
+            echo "the controller image is not built on the NGINX base image of this run"
+            exit 1
+          fi
+          docker run --rm "${IMAGE}:${VERSION}-${ARCH}" /nginx-ingress-controller --version | tee version.txt
+          grep -qE "Release:[[:space:]]+${VERSION}[[:space:]]*$" version.txt
+          grep -q 'nginx version: nginx/' version.txt
+          docker image inspect --format '{{json .Config.Labels}}' "${IMAGE}:${VERSION}-${ARCH}" | jq .
+      - name: Push the image
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin <<<"${GH_TOKEN}"
+          docker push "${IMAGE}:${VERSION}-${ARCH}"
+
+  merge:
+    needs: [resolve, build]
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    env:
+      VERSION: ${{ needs.resolve.outputs.version }}
+    steps:
+      - name: Merge and verify the manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin <<<"${GH_TOKEN}"
+          ref="${IMAGE}:${VERSION}"
+          docker buildx imagetools create -t "${ref}" "${ref}-amd64" "${ref}-arm64"
+          out=$(docker buildx imagetools inspect "${ref}")
+          echo "${out}"
+          grep -q 'linux/amd64' <<<"${out}"
+          grep -q 'linux/arm64' <<<"${out}"
+          {
+            echo '```'
+            echo "${out}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
