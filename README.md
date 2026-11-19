@@ -23,6 +23,17 @@ controller:
     digest: ""
 ```
 
+For the chroot variant:
+
+```yaml
+controller:
+  image:
+    registry: ghcr.io/evil8io/images
+    tag: v1.15.16
+    chroot: true
+    digestChroot: ""
+```
+
 ## License
 
 [Apache License 2.0](LICENSE). The image also contains third-party software under other licenses, including the GPL.
