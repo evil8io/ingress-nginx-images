@@ -2,9 +2,9 @@
 
 Container images of the ingress-nginx controller for `linux/amd64` and `linux/arm64`.
 
-The Kubernetes project archived [kubernetes/ingress-nginx](https://github.com/kubernetes/ingress-nginx) in March 2026,
-so its images no longer receive security fixes. These images are based on the ingress-nginx
-[fork](https://github.com/chainguard-forks/ingress-nginx) maintained by Chainguard, which still receives security fixes.
+The Kubernetes project archived [kubernetes/ingress-nginx](https://github.com/kubernetes/ingress-nginx) in March 2026.
+These images are based on the ingress-nginx [fork](https://github.com/chainguard-forks/ingress-nginx) maintained by
+Chainguard.
 
 ## Usage
 
